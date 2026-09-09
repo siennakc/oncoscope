@@ -1,0 +1,35 @@
+{
+ "name": "c16_abmil_v1",
+ "task": "slide-level metastasis detection (any tumor vs normal)",
+ "source": {
+  "bucket": "https://camelyon-dataset.s3.us-west-2.amazonaws.com/CAMELYON16",
+  "license": "CC0",
+  "reference": "evaluation/reference.csv (official)"
+ },
+ "counts": {
+  "train": 216,
+  "val": 54,
+  "test": 129,
+  "train_tumor": 89,
+  "val_tumor": 22,
+  "test_tumor": 49
+ },
+ "split": {
+  "method": "camelyon_lib.stratified_split",
+  "seed": 0,
+  "val_frac": 0.2,
+  "test": "official CAMELYON16 evaluation set (not a carve-out)"
+ },
+ "sha256": {
+  "train.csv": "82c19c6d24d564c4ecd1ecf6d058bd5bfc3f972e27fa9fda007edf7312ddcc86",
+  "val.csv": "68cdf21db15ebfc412667814aedcccef356ca753cf71d721a5cff28c72d88ecc",
+  "test_SEALED.csv": "1a197cdb9f930dbea0412e551036303b92cd5ba410e6745cbdb518230f177a62"
+ },
+ "seal_policy": {
+  "query_budget": 1,
+  "enforced_by": "scripts/bench/train_abmil.py --official-test (refuses without a registered protocol; refuses a second run)",
+  "statement": "No model, hyperparameter choice, or aggregation may be informed by test slides. Test embeddings are computed blind and scored once."
+ },
+ "built": "2026-09-02 21:56:44",
+ "git_sha": "9d5c4b91d5ab"
+}

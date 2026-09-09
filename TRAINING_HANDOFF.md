@@ -1,175 +1,206 @@
-# Training-machine handoff — for the agent running the next session
+# Training-machine handoff — FM + ABMIL round (Dean's feedback, made rigorous)
 
-You are an AI agent working in the `oncoscope` checkout (formerly `cancer-vm` —
-renamed 2026-09-02; GitHub redirects the old remote, but update your origin URL)
-on the training machine
-(Apple Silicon, MPS, `data/raw/` populated with the 126 GB corpus, `.venv` with
-torch). This document is your work order. It was written by the agent working
-with Sienna on her machine on 2026-08-31/09-01; everything referenced here is
-committed on `main`.
+You are an AI agent working in the `oncoscope` checkout on the training machine
+(Apple Silicon, MPS, `data/raw/` populated, `.venv` with torch). This document
+is your work order. It was written by the agent working with Sienna on her
+machine on 2026-09-07; everything referenced here is committed on `main`.
+The previous work order (patch stage + A/B rematches) is DONE — its results
+are in `TRAINING_HISTORY.md` Part 8.
+
+Context: Dean Tessone (CSI-Cancer) reviewed the project and named two upgrades
+for the CAMELYON16 lane — a pathology foundation model instead of the
+ImageNet/PCam encoder, and ABMIL instead of top5_mean. Both are now
+implemented; this round produces the measured answer. The research and
+fact-checked model comparison live in the "Oncoscope FM Field Guide" artifact;
+the short version is inline below.
 
 ## Prime directives (read before any command)
 
-1. **Refusals are features.** The scripts now enforce split provenance, shard
-   hashes, taint, and lineage in code. If a script refuses to run, it is
-   working — diagnose, never bypass. Specifically: never pass
-   `--allow-unquarantined` or `--allow-tainted-shards` on real data, and never
-   work around `SealedProvenanceError` or `SplitViolation`.
-2. **The internal sealed set (`sealed_test_v1`) is off-limits for every model
-   trained under splits_v2** (v3, v4, and everything you train here). The
-   scorer now refuses this in code. Do not spend its queries.
-3. **The MIAS benchmark has a 20-query budget (2 spent).** Do not score it
-   casually; one run per finished model generation, at most.
-4. **Commit conventions:** author is Sienna Chen, no AI co-author trailers,
-   result JSONs and CARDs are committed, weights go to GitHub releases, raw
-   data and caches never enter git. Pull before you start; rebase, never
-   force-push.
-5. **Expected numbers below are sanity rails, not targets.** If a number lands
-   far outside its rail, stop and investigate rather than proceeding.
+1. **Refusals are features.** Scripts enforce provenance, seals, and the query
+   budget in code. If a script refuses, it is working — diagnose, never
+   bypass. In particular `--exclude` exists to *record* a deliberate dropped
+   slide in the protocol; it is not a way to silence a missing-bag refusal you
+   have not understood.
+2. **The C16 official test is ONE query this round, and the code now enforces
+   it globally.** `data/manifests/c16_abmil_v1/official_queries.jsonl` is the
+   ledger: `--official-test` refuses once `query_budget` (1, in
+   `dataset.json`) is spent, no matter which encoder, seed, or output
+   directory you run from. Another seed is NOT another shot. Every other cell
+   of the 2×2 below is reported on the 54-slide val split only. A second query
+   is a governance decision — you raise the budget in `dataset.json`
+   deliberately, in a commit, with the reason — never a rerun.
+3. **Sealed sets from the mammography lane remain off-limits** (sealed_test_v1;
+   MIAS budget 20, 2 spent). Unchanged.
+4. **Commit conventions:** author Sienna Chen, no AI co-author trailers,
+   result JSONs/CARDs committed, weights to GitHub releases, raw data and
+   embedding caches never in git. Pull before you start; rebase, never
+   force-push. `runs/` is gitignored — the committable artifacts are mirrored
+   to `results/c16_abmil/<run_key>/` for you.
+5. **Geometry is part of every claim.** Round 1 runs at `--mpp 0.972`
+   (the PCam geometry — 4× cheaper than the FM-native 0.5, and the honest
+   apples-to-apples frame against the 0.827 baseline). Every number you write
+   down states its mpp. Do not mix geometries inside a comparison.
 
 ## Step 0 — Sync and verify (10 min)
 
 ```sh
 git pull --rebase
-.venv/bin/pip install -e '.[dev]' --quiet
-.venv/bin/python -m pytest
+.venv/bin/pip install -e '.[dev,fm]' --quiet
+.venv/bin/python -m pytest -q
 ```
 
-- Expect **80 passed** (the torch geometry-equivalence test SKIPS on machines
-  without torch; here it must RUN and pass — it pins patch coordinates to the
-  letterbox the models actually see).
-- Verify `data/processed/splits_v2.json` exists with sha
-  `45cc17cb8593ec2911ffc8c1e3bcdd83c1961ababfa0b70053889d883ce6a4b8`
-  (`python -c "import json; print(json.load(open('data/processed/splits_v2.json'))['sha256'])"`).
-- Note what changed since you last worked here: any-malignant gold labels
-  (11 flips in `cases_v1.jsonl`), density bands backfilled for all calc cases,
-  `finetune_encoder.py` defaults to splits_v2, `eval_public_cbis.py` takes
-  `--encoder-checkpoint`, `ab_harness_bench.py` defaults to native-resolution
-  Arm B input, and the whole patch stage below is new. `git log --oneline
-  95ed753..HEAD` lists it all.
+- Expect **100 passed**. The `fm` extra is new (torch/timm/transformers/
+  tiffslide) — without it the embedder cannot import.
+- New since the patch stage: `src/oncoscope/models/abmil.py` (gated ABMIL),
+  `scripts/bench/embed_c16_fm.py` (FM bag embedder + model registry),
+  `scripts/bench/train_abmil.py` (manifest-driven trainer, protocol
+  pre-registration, ledger-enforced official test, attention export/render),
+  `scripts/build_c16_manifests.py` + `data/manifests/c16_abmil_v1/` (sealed
+  manifests: 216 train / 54 val / 129 test), `tests/test_camelyon_lib.py`,
+  and `camelyon_lib` grew `stratified_split`, per-call `patch`/`target_mpp`,
+  and a validating `fetch`.
+- Smoke the wiring before anything long:
+  `.venv/bin/python scripts/bench/embed_c16_fm.py --model phikon --smoke`
+  and `--model pcam_resnet --smoke` (the latter needs `runs/pcam/best_model.pt`,
+  which lives on this machine only). Expect `SMOKE OK` with dims 768 and 2048.
 
-## Step 1 — Patch stage (the main event; ~2 h compute + ~50-60 GB download)
+## Step 0.5 — HuggingFace auth (Sienna's step, not yours)
 
-Read `PATCH_STAGE_RUNBOOK.md` first — it explains why each guard exists.
-Commands, in order:
+Gated models (`virchow2`, `uni`, `uni2_h`) need Sienna's HF token on this
+machine: she runs `.venv/bin/hf auth login` herself and pastes her token.
+Never handle the token for her. Access on the hub side is already granted
+(MahmoodLab + paige-ai, approved 2026-09-03). Phikon and `pcam_resnet` need no
+auth — do not block on this step.
+
+## Step 1 — Round-1 embeddings (the long job; start it first)
+
+Slide lists come from the sealed manifests:
 
 ```sh
-# 1a. Fetch ROI-mask + crop series. Resumable; exits nonzero while any series
-#     is still failed. Re-run until it prints "complete, zero failed series".
-.venv/bin/python scripts/fetch_cbis_roi.py
+cd data/manifests/c16_abmil_v1
+tail -n +2 train.csv | cut -d, -f1 > /tmp/c16_train.txt        # 216
+tail -n +2 val.csv   | cut -d, -f1 > /tmp/c16_val.txt          #  54
+tail -n +2 test_SEALED.csv | cut -d, -f1 > /tmp/c16_test.txt   # 129
+cd ../../..
 
-# 1b. Build the patch dataset (train+calibration patients of splits_v2 ONLY).
-.venv/bin/python scripts/build_patch_dataset.py
+# 1a. Phikon bags, train+val (resumable; ~12-25 h embed + download —
+#     run in a persistent session, re-run on interruption, it skips cached):
+.venv/bin/python scripts/bench/embed_c16_fm.py --model phikon --mpp 0.972 \
+    --list-file /tmp/c16_train.txt
+.venv/bin/python scripts/bench/embed_c16_fm.py --model phikon --mpp 0.972 \
+    --list-file /tmp/c16_val.txt
+
+# 1b. pcam_resnet bags, train+val (fast — ResNet-50 at ~100+ t/s, 96px;
+#     it auto-selects its native 96px/0.972 geometry, same run_key suffix):
+.venv/bin/python scripts/bench/embed_c16_fm.py --model pcam_resnet \
+    --list-file /tmp/c16_train.txt
+.venv/bin/python scripts/bench/embed_c16_fm.py --model pcam_resnet \
+    --list-file /tmp/c16_val.txt
 ```
 
-Sanity rails for 1b: ROI table status counts should be overwhelmingly `ok`
-(a handful of `mask_dims_mismatch` is the known CBIS defect and fine; more
-than ~2% `no binary raster`/`unresolvable` means the fetch is incomplete —
-stop). "images selected" should be roughly 1,600–2,000 (ddsm train+calibration
-images with usable ROIs); a wholesale drop triggers the built-in warning —
-heed it. Commit `data/processed/roi_v1.jsonl` when clean.
+Output lands in `runs/c16/embeds/phikon_mpp0.972/` and
+`runs/c16/embeds/pcam_resnet_mpp0.972/` — those exact paths are what `--embeds`
+wants in Step 2.
+
+Resume semantics (all enforced in code, so trust them): downloads are
+size- and TIFF-magic-validated before use, bags are written atomically, and a
+slide that yields zero tissue tiles is recorded in `_failed.json` rather than
+cached as a good empty bag. Re-running after any interruption is safe.
+
+Sanity rails: ~270 `.npz` bags per model; tiles/slide roughly 2k–15k at
+0.972 mpp (the script warns below 200 tiles — look at that slide's thumbnail
+before trusting its bag); `dim` 768 (phikon) / 2048 (pcam_resnet). Disk:
+phikon bags ~5 GB fp16, pcam_resnet ~13 GB. If `_failed.json` appears,
+investigate before Step 2 — a missing bag will (correctly) refuse to train.
+
+## Step 2 — The 2×2 on validation (minutes per cell, no test contact)
+
+The train/val split is the committed manifest, hash-checked on every run;
+`--seed` changes model init and shuffling ONLY, so three seeds give a real
+seed-variance number on one fixed val set.
 
 ```sh
-# 1c. Train the 5-class patch classifier (~30-60 min at 224px on MPS).
-.venv/bin/python scripts/train_patch_model.py --run runs/patch_v1
+# FM + ABMIL (three seeds — C16 is small; report val mean ± std):
+for s in 0 1 2; do
+  .venv/bin/python scripts/bench/train_abmil.py \
+      --embeds runs/c16/embeds/phikon_mpp0.972 --seed $s
+done
+
+# ResNet + ABMIL (isolates the aggregator's contribution):
+for s in 0 1 2; do
+  .venv/bin/python scripts/bench/train_abmil.py \
+      --embeds runs/c16/embeds/pcam_resnet_mpp0.972 --seed $s
+done
 ```
 
-Sanity rails: calibration macro-AUROC should clear 0.60 within 2 epochs and
-plateau somewhere ≥0.75. The checkpoint must show
-`splits_sha256 = 45cc17cb…` and `tainted: False`. If the loader is slow or
-memory balloons, something regressed in the lazy-memmap dataset — stop.
+The 2×2 this produces (all val-side except the existing baseline):
 
-```sh
-# 1d. Whole-image v5: same v3 recipe, warm-started from the patch backbone.
-#     (The script verifies the lineage sha itself; splits_v2 is the default.)
-.venv/bin/python scripts/finetune_encoder.py \
-    --init-weights runs/patch_v1/best_model.pt \
-    --run runs/finetune_v5
+|                       | top5_mean            | ABMIL                     |
+|-----------------------|----------------------|---------------------------|
+| PCam-ResNet features  | 0.827 (official, old)| val mean±std (this step)  |
+| Phikon features       | —                    | val mean±std (this step)  |
 
-# 1e. Embeddings + calibrated head for v5 (mirror the v3 pattern):
-.venv/bin/python scripts/cache_embeddings.py --tag resnet50_ft_v5_448_raw \
-    --weights runs/finetune_v5/best_model.pt --raw --gray-stats
-# adapt scripts/refit_heads_v3.py -> refit_heads_v5.py (paths/tag only)
+(The FM+top5_mean cell needs a tile-level probe on FM features — optional;
+skip unless the two ABMIL cells leave the attribution genuinely ambiguous.)
 
-# 1f. Optionally: repeat the v4 high-res post-train on top of v5
-#     (scripts/posttrain_hr.py — read its args first) as v5hr, then re-embed.
-```
+Sanity rails: phikon+ABMIL val AUROC should land well above the 0.827-era
+regime (the ACMIL literature says ImageNet→SSL features move ABMIL ~0.79→
+~0.94; at 0.972 mpp expect something between). If pcam_resnet+ABMIL ≈
+phikon+ABMIL, the FM bought little and that is itself the finding — record
+it either way. Note the registered model is the LAST epoch of the cosine
+schedule, not an epoch-selected best (`model_selection` in protocol.json says
+so): val AUROC is therefore an honest held-out number, not a max over epochs.
 
-Sanity rails for v5: calibration AUROC at 448px should be ≥ v3's 0.8331; if
-the warm start does not beat the cold start, that is itself a reportable
-result — record it either way in `TRAINING_HISTORY.md`.
+## Step 3 — Pre-register, then the ONE official test shot
 
-## Step 2 — Re-score the public benchmark (30 min, no training)
+1. Pick the headline config = best val AUROC among the seeds/encoders above.
+   **Write down its encoder AND its seed** — you need both in step 4.
+2. Its `protocol.json` (already mirrored to
+   `results/c16_abmil/<run_key>/protocol.json`) is the pre-registration —
+   commit it, and note the chosen run_key plus the val table in the CARD draft
+   BEFORE embedding a single test slide.
+3. Embed the 129 test slides with the chosen encoder only:
+   ```sh
+   .venv/bin/python scripts/bench/embed_c16_fm.py --model <chosen> \
+       --mpp 0.972 --list-file /tmp/c16_test.txt
+   ```
+4. One shot. **Pass the winning seed explicitly** — omitting `--seed` means
+   seed 0, which would score a different model than the one you pre-registered
+   and spend the budget doing it:
+   ```sh
+   .venv/bin/python scripts/bench/train_abmil.py \
+       --embeds runs/c16/embeds/<chosen>_mpp0.972 --seed <winning seed> \
+       --official-test
+   ```
+   The ledger is charged before scoring, so a crash mid-eval still counts as
+   the shot — that is deliberate. The aggregate result is mirrored to
+   `results/c16_abmil/<run_key>/official_test.json`; per-slide test scores stay
+   in `runs/` on purpose (hand-tuning against them is how a sealed set dies).
+5. Render 3–5 attention overlays, tumor and normal slides both
+   (`--render test_XXX --seed <winning seed>`) — the interpretability artifact
+   Dean contrasted with top5_mean. PNGs land in
+   `results/c16_abmil/<run_key>/attention/`; commit them with the CARD.
 
-The committed density grids are mass-only-stale and the gold labels changed
-(4 bench images flipped to malignant — the old error DEPRESSED AUROC).
-Embeddings are label-free, so v3/v4 need no recompute:
+## Step 4 — Write it up
 
-```sh
-.venv/bin/python scripts/eval_public_cbis.py --tag resnet50_ft_v3_448_raw \
-    --head runs/finetune_v3_head/head.json --name finetune_v3 \
-    --encoder-checkpoint runs/finetune_v3/best_model.pt
-.venv/bin/python scripts/eval_public_cbis.py --tag resnet50_ft_v4_1152x896_raw \
-    --head runs/finetune_v4_head/head.json --name posttrain_v4 \
-    --encoder-checkpoint runs/posttrain_v4/best_model.pt
-# then v5 (and v5hr) the same way
-```
+`results/c16_abmil/CARD.md` + a `TRAINING_HISTORY.md` Part 9 in the ledger
+style: the 2×2 with CIs, the official number vs 0.827, wall times, geometry
+(0.972 mpp) stated on every figure, the site caveat (C16 is ~two centers;
+FM embeddings encode scanner fingerprints — CAMELYON17 is the multi-center
+stress test we have NOT run), and any guard refusals with resolutions.
+Commit `results/c16_abmil/` (protocols, aggregate official JSON, attention
+PNGs) and `data/manifests/c16_abmil_v1/official_queries.jsonl` — the ledger is
+the audit trail proving the shot was spent once.
 
-- Every report must print `encoder lineage verified` — if it refuses, the
-  lineage is genuinely wrong; investigate, don't drop the flag.
-- Expect v4 to land slightly ABOVE 0.7707 (label-fix direction) with density
-  slices now summing to n=709. Update the README results table and
-  `TRAINING_HISTORY.md` with the re-scored numbers; the fresh JSONs replace
-  the stale-annotated ones.
-
-## Step 3 — The harness A/B rematch (the experiment that decides the lane)
-
-Two runs, in this order:
-
-```sh
-# 3a. Handicap-isolation run: unchanged v4 proposer, now at native resolution
-#     (the recorded -0.071 fed Arm B 1600px input; this measures the honest
-#     gap with the OLD architecture). Budget 2-4x the recorded 50 min.
-.venv/bin/python scripts/ab_harness_bench.py --out results/ab_harness/report_native_v4.json
-```
-
-```sh
-# 3b. The real rematch: patch detector as the proposer. Wire it in
-#     ab_harness_bench.py in place of V4WindowDetector with a thin adapter:
-#
-#   from oncoscope.models.patch_detector import PatchDetector
-#   from oncoharness.reference.detector import Candidate
-#   class PatchProposer:
-#       def __init__(self):
-#           self.det = PatchDetector(weights_path="runs/patch_v1/best_model.pt")
-#           self.forwards = 0
-#       def propose(self, pixels):
-#           cands = self.det.propose(pixels)
-#           self.forwards += 1
-#           return [Candidate(box=c.box, score=c.score) for c in cands]
-#
-#     Keep the v4 whole-image score as an anchor feature at aggregation if the
-#     harness supports fusion; otherwise run detector-pure and note it.
-.venv/bin/python scripts/ab_harness_bench.py --out results/ab_harness/report_patch_rematch.json
-```
-
-Report BOTH deltas with their CIs in a CARD update, whatever their sign.
-The pre-registered question: does the paired ΔAUROC (harness − model) CI
-cross zero once the proposer can localize? Either answer ships.
-
-## Step 4 — Small cleanups while queues run
-
-- `scripts/bench/train_pcam.py` now writes `results/bench_pcam/report.json`
-  — re-run it so the claimed 0.964 has an artifact (it is validation-split
-  only; the report says so itself).
-- `gh release create weights-v5 runs/finetune_v5/best_model.pt runs/finetune_v5/checkpoint.pt`
-  (sha256 in the notes, matching the v2–v4 releases).
-- Commit: result JSONs, CARDs, `roi_v1.jsonl`, `build_report.json` is cache —
-  do NOT commit shards/embeddings/weights.
+Round 2 decision (record, don't run): Virchow2 at 0.972 and/or the chosen
+encoder at 0.5 mpp — each needs a new pre-registration AND a deliberate budget
+change in `dataset.json`. Note for round 2: the tile-extraction geometry fix
+(2026-09-07) only changes behavior when the pyramid level's mpp differs from
+the target by >2%, which at 0.972 never happens — so a 0.5 mpp round is the
+first run that actually exercises the resampling path.
 
 ## Reporting back
 
-Update `TRAINING_HISTORY.md` in the established intervention-ledger style:
-what was run, wall time, every metric moved (or not), and any refusal a guard
-raised with its resolution. If a sanity rail was breached, the writeup of why
-matters more than the run itself. Sienna's session will pull and review.
+Update `TRAINING_HISTORY.md`, commit result JSONs + CARD + attention PNGs +
+the query ledger, push. Sienna's session will pull and review, and she'll take
+the result to Dean.
