@@ -107,11 +107,48 @@ size- and TIFF-magic-validated before use, bags are written atomically, and a
 slide that yields zero tissue tiles is recorded in `_failed.json` rather than
 cached as a good empty bag. Re-running after any interruption is safe.
 
-Sanity rails: ~270 `.npz` bags per model; tiles/slide roughly 2k–15k at
-0.972 mpp (the script warns below 200 tiles — look at that slide's thumbnail
-before trusting its bag); `dim` 768 (phikon) / 2048 (pcam_resnet). Disk:
-phikon bags ~5 GB fp16, pcam_resnet ~13 GB. If `_failed.json` appears,
-investigate before Step 2 — a missing bag will (correctly) refuse to train.
+Sanity rails, MEASURED on `normal_006` (2026-09-09, this exact code) rather
+than estimated — trust these over any earlier figure:
+
+| quantity | measured |
+|---|---|
+| level chosen at `--mpp 0.972` | level 2, 24448x54272, scale 1.000 (no resampling) |
+| tiles at 224px | 360 (1.4% of the 26,378-cell grid) |
+| tiles at 96px, same mask | 1850 — the ~5.1x the area ratio predicts |
+| bag on disk | 504 KB fp16 (360 x 768) |
+| embed time, slide already local | 31 s |
+| slide download | 1.22 GB |
+
+So: ~270 `.npz` bags per model; **tiles/slide in the hundreds, not thousands**
+(the script warns below 200 — look at that slide's thumbnail before trusting
+its bag); `dim` 768 (phikon) / 2048 (pcam_resnet). Bag disk is negligible —
+about **0.15 GB** for all of phikon and ~2 GB for pcam_resnet, NOT the 5/13 GB
+an earlier draft of this document claimed. The real disk constraint is the one
+slide held transiently (1-3 GB, occasionally more).
+
+**This job is download-bound, not GPU-bound.** At the measured ~12 MB/s and
+~2.2 GB/slide, the 270 train+val slides are ~594 GB and ~14 h of transfer,
+against only ~1.2 h of MPS embedding. Prefetch overlaps the two, so wall clock
+tracks your bandwidth; on a faster link the whole round is a few hours. Do not
+be alarmed if MPS looks idle — that is the expected shape.
+
+**Disk headroom is the one hard requirement.** The embedder streams one slide
+at a time, but `prefetch` downloads the NEXT slide while the current one
+embeds, so two slides sit on disk at once. Sampled 24 of the 216 train slides:
+median 2.03 GB, max 3.97 GB, mean 2.09 GB (hence the ~565 GB total transfer).
+Worst-case peak is therefore **~7 GB**, and you want **20 GB+ free** so a run
+of large adjacent slides cannot wedge the job. Check `df -h` before starting.
+
+Tissue detection was audited on 2026-09-09 and needs no change: the mask is
+computed on the smallest pyramid level, which looked alarmingly coarse (191x424
+for a 24448x54272 level-2 slide, under 2 thumbnail px per 224px tile), but
+recomputing it at every level from 6112x13568 down to 191x424 moved the tissue
+fraction only between 1.32% and 1.22% and the tile count between 356 and 360.
+The coarse thumbnail is not discarding tissue — do not "fix" it, and note that
+changing it would move both arms of the 2x2 and break comparability with 0.827.
+
+If `_failed.json` appears, investigate before Step 2 — a missing bag will
+(correctly) refuse to train.
 
 ## Step 2 — The 2×2 on validation (minutes per cell, no test contact)
 
