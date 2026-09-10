@@ -85,6 +85,12 @@ REGISTRY = {
                                     mlp_ratio=2.66667 * 2, no_embed_class=True,
                                     reg_tokens=8, init_values=1e-5,
                                     dynamic_img_size=True, swiglu=True)),
+    # Generic (non-pathology) ImageNet ResNet-50, GAP 2048-d. The control the
+    # FM literature reports against: run at the SAME patch/mpp as the FM so the
+    # ONLY difference is the encoder. Weaker than pcam_resnet (which is
+    # fine-tuned on lymph-node patches), so it flatters the FM — say so in any
+    # writeup, and prefer pcam_resnet when its checkpoint is available.
+    "imagenet_resnet": dict(kind="imagenet", dim=2048, gated=False),
     # The CURRENT tile encoder's features (PCam-trained ResNet-50, GAP 2048-d,
     # raw [0,1] input, 96px @ 0.972 mpp — the geometry it was trained on).
     # Purpose: the ResNet+ABMIL cell of the 2x2, isolating what the FM buys
@@ -117,6 +123,21 @@ def load_fm(key: str, device: torch.device):
         @torch.no_grad()
         def embed(x):  # trained on raw [0,1] RGB — no normalization
             return net(x.to(device)).float().cpu().numpy()
+
+        return embed, spec["dim"]
+
+    if spec["kind"] == "imagenet":
+        import torchvision
+        net = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+        net.fc = torch.nn.Identity()
+        net = net.eval().to(device)
+        mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None].to(device)
+        std = torch.tensor([0.229, 0.224, 0.225])[:, None, None].to(device)
+
+        @torch.no_grad()
+        def embed(x):
+            return net((x.to(device) - mean) / std).float().cpu().numpy()
 
         return embed, spec["dim"]
 
@@ -219,13 +240,20 @@ def record_failure(out_dir: Path, name: str, reason: str) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="phikon", choices=sorted(REGISTRY))
+    ap.add_argument("--model", default="phikon",
+                    help="encoder, or a comma-separated list to embed every "
+                         "slide with several encoders in ONE download pass "
+                         f"(choices: {', '.join(sorted(REGISTRY))})")
     ap.add_argument("--list", default="")
     ap.add_argument("--list-file", default="")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--mpp", type=float, default=FM_MPP,
                     help="target um/px (0.5 = FM-native 20x; 0.972 = PCam geometry)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="concurrent byte-range connections per slide; S3 throttles "
+                         "a single connection well below the link (2 vs 17 MB/s here). "
+                         "1 restores plain resumable curl")
     ap.add_argument("--device", default=None,
                     help="cuda / mps / cpu (auto-detected; CPU must be explicit)")
     ap.add_argument("--smoke", action="store_true",
@@ -235,8 +263,13 @@ def main() -> None:
     dev = torch.device(args.device or ("cuda" if torch.cuda.is_available()
                        else "mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"[fm] device: {dev}", flush=True)
+    models = [m for m in args.model.split(",") if m]
+    unknown = [m for m in models if m not in REGISTRY]
+    if unknown:
+        raise SystemExit(f"[fm] unknown model(s) {unknown}; choices: {sorted(REGISTRY)}")
     if args.smoke:
-        smoke(args.model, dev)
+        for m in models:
+            smoke(m, dev)
         return
     if dev.type == "cpu" and args.device != "cpu":
         raise SystemExit("[fm] REFUSED: no CUDA/MPS device found — a CPU embed is "
@@ -248,80 +281,96 @@ def main() -> None:
     if not names:
         raise SystemExit("no slides: pass --list or --list-file (or --smoke)")
 
-    spec = REGISTRY[args.model]
-    patch = spec.get("patch", FM_PATCH)
-    if args.mpp == FM_MPP and "default_mpp" in spec:
-        args.mpp = spec["default_mpp"]
-        print(f"[fm] {args.model}: using its native geometry "
+    # Every encoder in one pass must see IDENTICAL tiles — that is the whole
+    # point of the comparison, and it is also what makes the extra encoder
+    # nearly free on a download-bound job. So they must agree on tile size.
+    patches = {m: REGISTRY[m].get("patch", FM_PATCH) for m in models}
+    if len(set(patches.values())) > 1:
+        raise SystemExit(f"[fm] REFUSED: encoders disagree on tile size {patches} — "
+                         "one pass must produce identical tiles for every encoder; "
+                         "run the differing one separately")
+    patch = next(iter(patches.values()))
+    if len(models) == 1 and args.mpp == FM_MPP and "default_mpp" in REGISTRY[models[0]]:
+        args.mpp = REGISTRY[models[0]]["default_mpp"]
+        print(f"[fm] {models[0]}: using its native geometry "
               f"{patch}px @ {args.mpp} um/px", flush=True)
-    embed, dim = load_fm(args.model, dev)
-    run_key = f"{args.model}_mpp{args.mpp:g}"
-    out_dir = Path("runs/c16/embeds") / run_key
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    embedders = {}
+    for m in models:
+        fn, d = load_fm(m, dev)
+        run_key = f"{m}_mpp{args.mpp:g}"
+        od = Path("runs/c16/embeds") / run_key
+        od.mkdir(parents=True, exist_ok=True)
+        embedders[m] = (fn, d, od)
+        print(f"[fm] {m}: dim={d} -> {od}", flush=True)
+    print(f"[fm] geometry: {patch}px @ {args.mpp} um/px, {len(models)} encoder(s) "
+          "per downloaded slide", flush=True)
     scratch = Path("runs/c16/slides")
     scratch.mkdir(parents=True, exist_ok=True)
 
-    import subprocess
+    def pending(nm):
+        """Encoders that still owe a bag for this slide."""
+        return [m for m in models if not (embedders[m][2] / f"{nm}.npz").exists()]
 
-    def prefetch(nm):
-        # into .part only — fetch() resumes/validates/renames it, so a failed
-        # or truncated prefetch is finished on the foreground path, never trusted
-        if nm and not (out_dir / f"{nm}.npz").exists() and not (scratch / f"{nm}.tif").exists():
-            return subprocess.Popen(
-                ["curl", "-fsSL", "--retry", "5", "-C", "-", "-o",
-                 str(scratch / f"{nm}.tif.part"), f"{BUCKET}/images/{nm}.tif"])
-        return None
-
-    pf = None
+    # No background prefetch: fetch() now saturates the link with concurrent
+    # byte ranges, so a second stream would only contend for the same ceiling
+    # (and its partial file would be discarded by the range download anyway).
+    # Peak disk stays exactly one slide.
     for idx, name in enumerate(names):
-        out = out_dir / f"{name}.npz"
-        if out.exists():
+        todo = pending(name)
+        if not todo:
             print(f"[fm] {name}: cached", flush=True)
             continue
         t0 = time.time()
         slide_path = scratch / f"{name}.tif"
-        if pf is not None:
-            pf.wait()
-            pf = None
-        fetch(f"images/{name}.tif", slide_path)
-        nxt = next((n for n in names[idx + 1:] if not (out_dir / f"{n}.npz").exists()), None)
-        pf = prefetch(nxt)
+        fetch(f"images/{name}.tif", slide_path, workers=args.workers)
         t_dl = time.time() - t0
         slide = open_slide(slide_path)
         level, scale = pick_level(slide, target_mpp=args.mpp)
         coords = tissue_tiles(slide, level, patch=patch)
-        embs, batch = [], []
+        embs = {m: [] for m in todo}
+        batch = []
         for tile in read_patches(slide, level, coords, scale, patch=patch):
             batch.append(torch.from_numpy(tile).permute(2, 0, 1))
             if len(batch) == args.batch:
-                embs.append(embed(torch.stack(batch)))
+                x = torch.stack(batch)
+                for m in todo:
+                    embs[m].append(embedders[m][0](x))
                 batch = []
         if batch:
-            embs.append(embed(torch.stack(batch)))
+            x = torch.stack(batch)
+            for m in todo:
+                embs[m].append(embedders[m][0](x))
         slide.close()
         if not args.keep:
             slide_path.unlink(missing_ok=True)
-        if not embs:
-            failed = record_failure(out_dir, name, "0 tissue tiles — inspect the "
-                                    "thumbnail; the tissue mask found nothing")
+        if not any(embs.values()):
+            for m in todo:
+                failed = record_failure(embedders[m][2], name,
+                                        "0 tissue tiles — inspect the thumbnail; "
+                                        "the tissue mask found nothing")
             print(f"[fm] {name}: FAILED, 0 tissue tiles — not cached, recorded in "
                   f"{failed}", flush=True)
             continue
-        bag = np.concatenate(embs)
-        if bag.shape[0] < 200:
-            print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
-                  "check the thumbnail before trusting this bag", flush=True)
-        save_bag(
-            out, embeddings=bag.astype(np.float16),
-            coords=np.array(coords, np.int32).reshape(-1, 2),
-            level=level, scale=scale, patch=patch, target_mpp=args.mpp,
-            model=args.model, repo=REGISTRY[args.model]["repo"])
-        meta = {"slide": name, "model": run_key, "n_tiles": int(bag.shape[0]),
-                "dim": dim, "level": level, "dl_s": round(t_dl, 1),
-                "total_s": round(time.time() - t0, 1)}
-        (out_dir / f"{name}.json").write_text(json.dumps(meta))
-        print(f"[fm] {name}: {bag.shape[0]} tiles x {dim}d "
-              f"({meta['total_s']:.0f}s)", flush=True)
+        n_tiles, dims = 0, []
+        for m in todo:
+            fn, dim, od = embedders[m]
+            bag = np.concatenate(embs[m])
+            n_tiles, _ = bag.shape[0], dims.append(f"{m}:{dim}d")
+            if bag.shape[0] < 200:
+                print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
+                      "check the thumbnail before trusting this bag", flush=True)
+            save_bag(
+                od / f"{name}.npz", embeddings=bag.astype(np.float16),
+                coords=np.array(coords, np.int32).reshape(-1, 2),
+                level=level, scale=scale, patch=patch, target_mpp=args.mpp,
+                model=m, repo=REGISTRY[m].get("repo", m))
+            (od / f"{name}.json").write_text(json.dumps(
+                {"slide": name, "model": f"{m}_mpp{args.mpp:g}",
+                 "n_tiles": int(bag.shape[0]), "dim": dim, "level": level,
+                 "dl_s": round(t_dl, 1), "total_s": round(time.time() - t0, 1)}))
+        print(f"[fm] {name}: {n_tiles} tiles x [{', '.join(dims)}] "
+              f"({time.time() - t0:.0f}s, dl {t_dl:.0f}s)", flush=True)
 
 
 if __name__ == "__main__":

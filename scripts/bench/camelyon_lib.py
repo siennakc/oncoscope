@@ -58,11 +58,67 @@ def looks_complete(path: Path, size: int | None) -> bool:
     return size is None or path.stat().st_size == size
 
 
-def fetch(rel: str, dest: Path) -> Path:
+def download_ranges(url: str, part: Path, size: int, workers: int = 8,
+                    attempts: int = 3) -> None:
+    """Fetch one file as N concurrent byte-ranges into a preallocated file.
+
+    S3 throttles a single connection (~2 MB/s here) far below the link's
+    capacity (~17 MB/s across 8), and these slides are ~2 GB each, so the
+    embedding job is otherwise download-bound for days. Ranges are written at
+    their own offsets in ONE preallocated file, so peak disk stays exactly one
+    slide — concatenating chunk files afterwards would double it. Each range
+    must deliver exactly its own byte count; the caller still checks total
+    size and TIFF magic before trusting the file.
+    """
+    import threading
+
+    import requests
+
+    with open(part, "wb") as fh:
+        fh.truncate(size)
+    step = size // workers
+    errors: list[str] = []
+
+    def grab(i: int) -> None:
+        lo = i * step
+        hi = size - 1 if i == workers - 1 else lo + step - 1
+        written = 0
+        for attempt in range(attempts):
+            written = 0
+            try:
+                r = requests.get(url, headers={"Range": f"bytes={lo}-{hi}"},
+                                 stream=True, timeout=(30, 120))
+                r.raise_for_status()
+                with open(part, "r+b") as fh:
+                    fh.seek(lo)
+                    for chunk in r.iter_content(1 << 20):
+                        fh.write(chunk)
+                        written += len(chunk)
+                if written == hi - lo + 1:
+                    return
+            except Exception as e:  # noqa: BLE001 - retried, then reported
+                if attempt == attempts - 1:
+                    errors.append(f"range {i} [{lo}-{hi}]: {e}")
+                    return
+        errors.append(f"range {i} [{lo}-{hi}]: got {written} of {hi - lo + 1} bytes")
+
+    threads = [threading.Thread(target=grab, args=(i,)) for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise RuntimeError(f"[fetch] parallel download failed: {errors[:3]}")
+
+
+def fetch(rel: str, dest: Path, workers: int = 1) -> Path:
     """Resumable download to dest.part, validated, then renamed into place.
 
     dest only ever holds a complete, validated file; a stale/corrupt dest
-    (from an older run) is replaced.
+    (from an older run) is replaced. ``workers`` > 1 fetches concurrent byte
+    ranges (see download_ranges) — a large win against S3's per-connection
+    throttling; it forgoes curl's resume, a good trade once a slide takes
+    ~2 min instead of ~15.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     url = f"{BUCKET}/{rel}"
@@ -73,7 +129,9 @@ def fetch(rel: str, dest: Path) -> Path:
         print(f"[fetch] {dest.name}: stale or corrupt, re-downloading", flush=True)
         dest.unlink()
     part = dest.with_name(dest.name + ".part")
-    if not (size is not None and part.exists() and part.stat().st_size >= size):
+    if workers > 1 and size and size > (32 << 20):
+        download_ranges(url, part, size, workers=workers)
+    elif not (size is not None and part.exists() and part.stat().st_size >= size):
         subprocess.run(["curl", "-fsSL", "--retry", "5", "-C", "-", "-o", str(part), url],
                        check=True)
     if not looks_complete(part, size):

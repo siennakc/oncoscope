@@ -105,3 +105,86 @@ def test_looks_complete_requires_tiff_magic_only_for_tif(tmp_path):
     assert not cl.looks_complete(t, None)
     t.write_bytes(np.zeros(8, np.uint8).tobytes().replace(b"\x00\x00\x00\x00", b"MM\x00*", 1))
     assert cl.looks_complete(t, 8) and not cl.looks_complete(t, 9)
+
+
+# --- parallel byte-range download -------------------------------------------
+# fetch(workers>1) is what makes the C16 embedding job tractable (S3 throttles
+# one connection to ~2 MB/s vs ~17 across 8), so the reassembly is pinned here:
+# a wrongly-ordered or short range would silently corrupt a slide.
+
+import http.server  # noqa: E402
+import socketserver  # noqa: E402
+import threading  # noqa: E402
+
+
+def _serve(directory, fail_ranges=()):
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(directory), **kw)
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            body = (directory / "blob.bin").read_bytes()
+            if rng is None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            lo, hi = (int(x) for x in rng.split("=")[1].split("-"))
+            if lo in fail_ranges:
+                self.send_response(500)
+                self.end_headers()
+                return
+            chunk = body[lo:hi + 1]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/blob.bin"
+
+
+@pytest.fixture
+def blob(tmp_path):
+    data = np.random.default_rng(0).integers(0, 256, 700_000, dtype=np.uint8).tobytes()
+    (tmp_path / "blob.bin").write_bytes(data)
+    return tmp_path, data
+
+
+def test_download_ranges_reassembles_exactly(blob, tmp_path):
+    d, data = blob
+    srv, url = _serve(d)
+    try:
+        for workers in (1, 4, 7):  # 7 does not divide the size evenly
+            out = tmp_path / f"out{workers}.bin"
+            cl.download_ranges(url, out, len(data), workers=workers)
+            assert out.read_bytes() == data, f"corrupt at workers={workers}"
+    finally:
+        srv.shutdown()
+
+
+def test_download_ranges_raises_on_a_failed_range(blob, tmp_path):
+    d, data = blob
+    step = len(data) // 4
+    srv, url = _serve(d, fail_ranges={step})  # worker 1's offset always fails
+    try:
+        with pytest.raises(RuntimeError, match="parallel download failed"):
+            cl.download_ranges(url, tmp_path / "bad.bin", len(data), workers=4,
+                               attempts=2)
+    finally:
+        srv.shutdown()
+
+
+def test_fetch_uses_plain_curl_below_the_parallel_threshold(tmp_path, monkeypatch):
+    """Small files must not take the range path (and tests must not need a server)."""
+    monkeypatch.setattr(cl, "remote_size", lambda url: 100)
+    monkeypatch.setattr(cl.subprocess, "run", _fake_curl(TIFF))
+    monkeypatch.setattr(cl, "download_ranges", lambda *a, **k:
+                        pytest.fail("range path used for a small file"))
+    assert cl.fetch("images/x.tif", tmp_path / "x.tif", workers=8).read_bytes() == TIFF
