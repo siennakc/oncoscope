@@ -118,3 +118,37 @@ def test_ragged_bags_and_subsampling():
     probs = predict(model, bags, device="cpu")
     assert probs.shape == (6,)
     assert np.isfinite(probs).all()
+
+
+def test_mean_pool_is_abmil_without_attention():
+    """The ablation must differ from ABMIL in exactly one way: no attention."""
+    from oncoscope.models.abmil import AGGREGATORS, MeanPoolMIL, attention
+    rng = np.random.default_rng(5)
+    bags, labels = [], []
+    for i in range(12):
+        bag, _ = _bag(rng, positive=i % 2 == 0)
+        bags.append(bag); labels.append(int(i % 2 == 0))
+    model, _ = train_abmil(bags, labels, embed_dim=DIM, epochs=3, device="cpu",
+                           aggregator="mean")
+    assert isinstance(model, MeanPoolMIL)
+    assert not any("attn" in n for n, _ in model.named_parameters())
+    # uniform attention: same interface, and an honest picture of mean pooling
+    a = attention(model, bags[0], device="cpu")
+    assert a.shape == (bags[0].shape[0],)
+    assert abs(a.sum() - 1.0) < 1e-5 and np.allclose(a, a[0])
+    probs = predict(model, bags, device="cpu")
+    assert probs.shape == (12,) and np.isfinite(probs).all()
+    assert set(AGGREGATORS) == {"abmil", "mean"}
+
+
+def test_attention_beats_mean_pooling_when_signal_is_sparse():
+    """Sanity-check the ablation measures something: with 4 signal tiles in 60,
+    attention should separate bags that mean pooling dilutes."""
+    (tr_bags, tr_labels, _), (va_bags, va_labels, _) = _world()
+    scores = {}
+    for agg in ("abmil", "mean"):
+        m, h = train_abmil(tr_bags, tr_labels, embed_dim=DIM, epochs=25,
+                           device="cpu", aggregator=agg, val_bags=va_bags,
+                           val_labels=va_labels)
+        scores[agg] = h[-1]["val_auroc"]
+    assert scores["abmil"] >= scores["mean"], scores

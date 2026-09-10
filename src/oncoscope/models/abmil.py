@@ -43,6 +43,33 @@ class GatedABMIL(nn.Module):
         return self.head(slide_repr).squeeze(-1), attn
 
 
+class MeanPoolMIL(nn.Module):
+    """Ablation twin of GatedABMIL: identical except attention is removed.
+
+    Same LayerNorm+Dropout front end, same linear head, same training recipe —
+    the bag representation is just the unweighted mean of its tiles. Comparing
+    the two isolates EXACTLY what attention contributes, with no other moving
+    part, which is the question Dean's top5_mean critique actually poses.
+
+    Returns uniform "attention" so it satisfies the same interface as
+    GatedABMIL (predict/attention work unchanged); a flat map is also the
+    honest picture of what mean pooling attends to.
+    """
+
+    def __init__(self, embed_dim: int, attn_dim: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.pre = nn.Sequential(nn.LayerNorm(embed_dim), nn.Dropout(dropout))
+        self.head = nn.Linear(embed_dim, 1)
+
+    def forward(self, bag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.pre(bag)
+        attn = torch.full((h.shape[0],), 1.0 / max(h.shape[0], 1), device=h.device)
+        return self.head(h.mean(dim=0)).squeeze(-1), attn
+
+
+AGGREGATORS = {"abmil": GatedABMIL, "mean": MeanPoolMIL}
+
+
 def train_abmil(
     bags: list[np.ndarray],
     labels: list[int],
@@ -54,6 +81,7 @@ def train_abmil(
     dropout: float = 0.1,
     max_tiles: int = 4096,
     seed: int = 0,
+    aggregator: str = "abmil",
     device: str | None = None,
     val_bags: list[np.ndarray] | None = None,
     val_labels: list[int] | None = None,
@@ -68,7 +96,8 @@ def train_abmil(
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     dev = torch.device(device or ("mps" if torch.backends.mps.is_available() else "cpu"))
-    model = GatedABMIL(embed_dim, attn_dim=attn_dim, dropout=dropout).to(dev)
+    model = AGGREGATORS[aggregator](embed_dim, attn_dim=attn_dim,
+                                    dropout=dropout).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     pos = max(sum(labels), 1)

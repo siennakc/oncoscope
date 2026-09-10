@@ -51,7 +51,9 @@ sys.path.insert(0, "src")
 sys.path.insert(0, "scripts/bench")
 import torch  # noqa: E402
 
-from oncoscope.models.abmil import _auroc, attention, predict, train_abmil  # noqa: E402
+from oncoscope.models.abmil import (  # noqa: E402
+    AGGREGATORS, _auroc, attention, predict, train_abmil,
+)
 
 MANIFESTS = Path("data/manifests/c16_abmil_v1")
 RESULTS = Path("results/c16_abmil")
@@ -172,6 +174,9 @@ def main() -> None:
     ap.add_argument("--max-tiles", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0,
                     help="model init + shuffling only; the split is the manifest")
+    ap.add_argument("--aggregator", default="abmil", choices=sorted(AGGREGATORS),
+                    help="abmil = gated attention; mean = unweighted mean pooling, "
+                         "the ablation that isolates what attention buys")
     ap.add_argument("--device", default=None)
     ap.add_argument("--official-test", action="store_true",
                     help="score the official test set under the manifest's query budget")
@@ -183,7 +188,9 @@ def main() -> None:
     # seed-suffixed run key so multi-seed runs never clobber each other;
     # seed 0 keeps the bare key. The one-shot guard does NOT live here — it is
     # the manifest ledger below, shared by every run key.
-    run_key = embed_dir.name + (f"_seed{args.seed}" if args.seed else "")
+    run_key = (embed_dir.name
+               + ("" if args.aggregator == "abmil" else f"_{args.aggregator}")
+               + (f"_seed{args.seed}" if args.seed else ""))
     out_dir = Path("runs/c16/abmil") / run_key
     out_dir.mkdir(parents=True, exist_ok=True)
     mirror = RESULTS / run_key
@@ -224,9 +231,8 @@ def main() -> None:
                      "finish embed_c16_fm.py on the test list. Excluding a "
                      "sealed test slide is not an option")
         ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
-        from oncoscope.models.abmil import GatedABMIL
-        model = GatedABMIL(ckpt["embed_dim"], attn_dim=ckpt["attn_dim"],
-                           dropout=ckpt["dropout"])
+        model = AGGREGATORS[ckpt.get("aggregator", "abmil")](
+            ckpt["embed_dim"], attn_dim=ckpt["attn_dim"], dropout=ckpt["dropout"])
         model.load_state_dict(ckpt["state"])
         bags = load_bags(embed_dir, names)
         # Everything fallible is done. Charge the ledger BEFORE scoring so a
@@ -277,15 +283,18 @@ def main() -> None:
         tr_bags, [l for _, l in tr_rows], embed_dim=embed_dim,
         epochs=args.epochs, lr=args.lr, attn_dim=args.attn_dim,
         dropout=args.dropout, max_tiles=args.max_tiles, seed=args.seed,
+        aggregator=args.aggregator,
         device=dev, val_bags=va_bags, val_labels=[l for _, l in va_rows],
         verbose=True)
     val_auroc = history[-1]["val_auroc"]
     torch.save({"state": model.state_dict(), "embed_dim": embed_dim,
-                "attn_dim": args.attn_dim, "dropout": args.dropout}, model_path)
+                "attn_dim": args.attn_dim, "dropout": args.dropout,
+                "aggregator": args.aggregator}, model_path)
     protocol = {
         "run_key": run_key, "embed_dim": embed_dim,
         "hyperparams": {k: getattr(args, k) for k in
-                        ("epochs", "lr", "attn_dim", "dropout", "max_tiles", "seed")},
+                        ("epochs", "lr", "attn_dim", "dropout", "max_tiles",
+                         "seed", "aggregator")},
         "split": {"manifests": str(mdir), "sha256": meta["sha256"],
                   "train": tr, "val": va, "excluded": excluded},
         "model_selection": "last epoch of the cosine schedule; val AUROC is "
