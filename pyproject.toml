@@ -24,8 +24,13 @@ agent = ["claude-agent-sdk>=0.1.0"]
 harness = ["oncoharness @ git+https://github.com/siennakc/Onco-Harness@0293cd025ad5295876376daaea90189dcada7957"]
 serving = ["fastapi>=0.110", "uvicorn>=0.29"]
 # CAMELYON16 foundation-model lane (embed_c16_fm.py / train_abmil.py)
+# tiffslide/tifffile are PINNED: scripts/bench/remote_slide.py relies on their
+# internals (series levels, page dataoffsets, is_jfif) and was verified
+# pixel-exact against these exact versions. Re-run tests/test_remote_slide.py
+# before bumping either.
 fm = ["torch>=2.4", "torchvision>=0.19", "timm>=1.0", "transformers>=4.45",
-      "huggingface_hub>=0.25", "tiffslide>=2.3", "pillow>=10"]
+      "huggingface_hub>=0.25", "tiffslide==4.0.0", "tifffile==2026.9.9",
+      "imagecodecs>=2024.1", "requests>=2.31", "pillow>=10"]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]

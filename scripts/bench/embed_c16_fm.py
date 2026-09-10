@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -52,9 +51,9 @@ sys.path.insert(0, "scripts/bench")
 import torch  # noqa: E402
 
 from camelyon_lib import (  # noqa: E402
-    BUCKET, fetch, open_slide, pick_level, read_patches, remote_size,
-    tissue_tiles,
+    BUCKET, fetch, open_slide, pick_level, read_patches, tissue_tiles,
 )
+from remote_slide import RangeFetchError, iter_tiles_remote  # noqa: E402
 
 FM_PATCH = 224
 FM_MPP = 0.5
@@ -252,13 +251,9 @@ def main() -> None:
     ap.add_argument("--mpp", type=float, default=FM_MPP,
                     help="target um/px (0.5 = FM-native 20x; 0.972 = PCam geometry)")
     ap.add_argument("--keep", action="store_true")
-    ap.add_argument("--min-free-gb", type=float, default=3.0,
-                    help="headroom to keep FREE after the next slide would land; "
-                         "prefetch pauses below it and the job runs serial")
-    ap.add_argument("--workers", type=int, default=8,
-                    help="concurrent byte-range connections per slide; S3 throttles "
-                         "a single connection well below the link (2 vs 17 MB/s here). "
-                         "1 restores plain resumable curl")
+    ap.add_argument("--workers", type=int, default=12,
+                    help="concurrent S3 range requests per slide; S3 throttles one "
+                         "connection far below the link (~2 vs ~17 MB/s here)")
     ap.add_argument("--device", default=None,
                     help="cuda / mps / cpu (auto-detected; CPU must be explicit)")
     ap.add_argument("--smoke", action="store_true",
@@ -309,7 +304,7 @@ def main() -> None:
         embedders[m] = (fn, d, od)
         print(f"[fm] {m}: dim={d} -> {od}", flush=True)
     print(f"[fm] geometry: {patch}px @ {args.mpp} um/px, {len(models)} encoder(s) "
-          "per downloaded slide", flush=True)
+          "per slide, tiles read remotely (no slide on disk)", flush=True)
     scratch = Path("runs/c16/slides")
     scratch.mkdir(parents=True, exist_ok=True)
 
@@ -317,70 +312,54 @@ def main() -> None:
         """Encoders that still owe a bag for this slide."""
         return [m for m in models if not (embedders[m][2] / f"{nm}.npz").exists()]
 
-    # Download and embed cost roughly the same per slide (~140 s each on a big
-    # one) and use different resources — network vs MPS — so the next slide is
-    # fetched on a worker thread while the current one embeds. That nearly
-    # halves wall clock. It also puts a SECOND slide on disk, so prefetch is
-    # skipped whenever free space is short: a stalled job beats a full disk.
-    from concurrent.futures import ThreadPoolExecutor
+    # Tiles are read straight from S3 (remote_slide): only the TIFF tiles the
+    # pipeline uses are fetched, into memory — ~1-5% of each ~2 GB slide and
+    # zero bytes on disk. The previous design downloaded whole slides to read
+    # one pyramid level, which on this 8 GB / ~96%-full machine exhausted swap
+    # and stalled the job for hours. Fetching is now ~7 s/slide against
+    # 60-280 s of embedding, so there is nothing left worth overlapping.
+    def slide_tiles(name):
+        """(coords, level, scale), tile iterator, report, source.
 
-    def room_to_prefetch(nm: str) -> tuple[bool, str]:
-        """Decide against the NEXT slide's real size, not a flat threshold.
-
-        Slides range ~1.2-4 GB, so one blanket number is wrong in both
-        directions: it blocks a safe 1.2 GB prefetch on a tight disk (costing
-        the download/embed overlap, which is most of the speedup) and would
-        wave through a 4 GB one on the same disk. A HEAD request costs ~0.2 s
-        against a ~150 s download, so just ask.
+        Remote by default. A full download is only a per-slide FALLBACK for a
+        TIFF layout the remote reader refuses (NotImplementedError); every
+        CAMELYON16 slide probed is Philips-format and reads remotely.
         """
-        free = shutil.disk_usage(scratch).free
-        size = remote_size(f"{BUCKET}/images/{nm}.tif") or (4 << 30)
-        margin = args.min_free_gb * (1 << 30)
-        ok = free - size > margin
-        return ok, (f"free {free / (1 << 30):.1f} GB, next slide "
-                    f"{size / (1 << 30):.1f} GB, margin {args.min_free_gb} GB")
-
-    def get(nm):
-        return fetch(f"images/{nm}.tif", scratch / f"{nm}.tif", workers=args.workers)
-
-    pool = ThreadPoolExecutor(max_workers=1)
-    inflight = {}
-    try:
-        todo_names = [n for n in names if pending(n)]
-        skipped = len(names) - len(todo_names)
-        if skipped:
-            print(f"[fm] {skipped} slides already cached", flush=True)
-        for idx, name in enumerate(todo_names):
-            todo = pending(name)
-            t0 = time.time()
-            slide_path = scratch / f"{name}.tif"
-            fut = inflight.pop(name, None)
-            if fut is not None:
-                try:
-                    fut.result()      # started while the previous slide embedded
-                except Exception as e:  # noqa: BLE001 - a flaky prefetch must
-                    # not kill a multi-hour job; the range download rewrites
-                    # from scratch, so refetching in the foreground is safe
-                    print(f"[fm] prefetch of {name} failed ({e}); refetching",
-                          flush=True)
-                    get(name)
-            else:
-                get(name)
-            t_dl = time.time() - t0
-            nxt = todo_names[idx + 1] if idx + 1 < len(todo_names) else None
-            if nxt and not inflight:
-                ok, why = room_to_prefetch(nxt)
-                if ok:
-                    inflight[nxt] = pool.submit(get, nxt)
-                else:
-                    print(f"[fm] prefetch paused ({why}) — running serial, "
-                          "free disk to restore the overlap", flush=True)
-            slide = open_slide(slide_path)
+        rep: dict = {}
+        try:
+            it = iter_tiles_remote(f"{BUCKET}/images/{name}.tif", target_mpp=args.mpp,
+                                   patch=patch, workers=args.workers, report=rep)
+            return next(it), it, rep, "remote"
+        except NotImplementedError as e:
+            print(f"[fm] {name}: remote reader refused ({e}) — full download "
+                  "fallback for this slide", flush=True)
+            path = scratch / f"{name}.tif"
+            fetch(f"images/{name}.tif", path, workers=args.workers)
+            slide = open_slide(path)
             level, scale = pick_level(slide, target_mpp=args.mpp)
             coords = tissue_tiles(slide, level, patch=patch)
+
+            def local():
+                try:
+                    yield from read_patches(slide, level, coords, scale, patch=patch)
+                finally:
+                    slide.close()
+                    if not args.keep:
+                        path.unlink(missing_ok=True)
+            return (coords, level, scale), local(), rep, "download"
+
+    todo_names = [n for n in names if pending(n)]
+    if len(names) > len(todo_names):
+        print(f"[fm] {len(names) - len(todo_names)} slides already cached", flush=True)
+    for name in todo_names:
+        todo = pending(name)
+        t0 = time.time()
+        try:
+            (coords, level, scale), tiles, rep, source = slide_tiles(name)
+            t_dl = time.time() - t0
             embs = {m: [] for m in todo}
             batch = []
-            for tile in read_patches(slide, level, coords, scale, patch=patch):
+            for tile in tiles:
                 batch.append(torch.from_numpy(tile).permute(2, 0, 1))
                 if len(batch) == args.batch:
                     x = torch.stack(batch)
@@ -391,38 +370,44 @@ def main() -> None:
                 x = torch.stack(batch)
                 for m in todo:
                     embs[m].append(embedders[m][0](x))
-            slide.close()
-            if not args.keep:
-                slide_path.unlink(missing_ok=True)
-            if not any(embs.values()):
-                for m in todo:
-                    failed = record_failure(embedders[m][2], name,
-                                            "0 tissue tiles — inspect the thumbnail; "
-                                            "the tissue mask found nothing")
-                print(f"[fm] {name}: FAILED, 0 tissue tiles — not cached, recorded in "
-                      f"{failed}", flush=True)
-                continue
-            n_tiles, dims = 0, []
+        except RangeFetchError as e:
+            # network fault: nothing is cached, so the next run retries this slide
             for m in todo:
-                fn, dim, od = embedders[m]
-                bag = np.concatenate(embs[m])
-                n_tiles, _ = bag.shape[0], dims.append(f"{m}:{dim}d")
-                if bag.shape[0] < 200:
-                    print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
-                          "check the thumbnail before trusting this bag", flush=True)
-                save_bag(
-                    od / f"{name}.npz", embeddings=bag.astype(np.float16),
-                    coords=np.array(coords, np.int32).reshape(-1, 2),
-                    level=level, scale=scale, patch=patch, target_mpp=args.mpp,
-                    model=m, repo=REGISTRY[m].get("repo", m))
-                (od / f"{name}.json").write_text(json.dumps(
-                    {"slide": name, "model": f"{m}_mpp{args.mpp:g}",
-                     "n_tiles": int(bag.shape[0]), "dim": dim, "level": level,
-                     "dl_s": round(t_dl, 1), "total_s": round(time.time() - t0, 1)}))
-            print(f"[fm] {name}: {n_tiles} tiles x [{', '.join(dims)}] "
-                  f"({time.time() - t0:.0f}s, dl {t_dl:.0f}s)", flush=True)
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+                record_failure(embedders[m][2], name, f"range fetch failed: {e}")
+            print(f"[fm] {name}: FAILED ({e}) — not cached; re-run to retry", flush=True)
+            continue
+        if not any(embs.values()):
+            for m in todo:
+                failed = record_failure(embedders[m][2], name,
+                                        "0 tissue tiles — inspect the thumbnail; "
+                                        "the tissue mask found nothing")
+            print(f"[fm] {name}: FAILED, 0 tissue tiles — not cached, recorded in "
+                  f"{failed}", flush=True)
+            continue
+        n_tiles, dims = 0, []
+        for m in todo:
+            fn, dim, od = embedders[m]
+            bag = np.concatenate(embs[m])
+            n_tiles = bag.shape[0]
+            dims.append(f"{m}:{dim}d")
+            if bag.shape[0] < 200:
+                print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
+                      "check the thumbnail before trusting this bag", flush=True)
+            save_bag(
+                od / f"{name}.npz", embeddings=bag.astype(np.float16),
+                coords=np.array(coords, np.int32).reshape(-1, 2),
+                level=level, scale=scale, patch=patch, target_mpp=args.mpp,
+                model=m, repo=REGISTRY[m].get("repo", m))
+            (od / f"{name}.json").write_text(json.dumps(
+                {"slide": name, "model": f"{m}_mpp{args.mpp:g}",
+                 "n_tiles": int(bag.shape[0]), "dim": dim, "level": level,
+                 "source": source, "mb_fetched": round(rep.get("bytes_fetched", 0) / 1e6, 1),
+                 "plan_misses": rep.get("plan_misses"),
+                 "fetch_s": round(t_dl, 1), "total_s": round(time.time() - t0, 1)}))
+        miss = f", {rep['plan_misses']} plan misses" if rep.get("plan_misses") else ""
+        print(f"[fm] {name}: {n_tiles} tiles x [{', '.join(dims)}] "
+              f"({time.time() - t0:.0f}s; {source} "
+              f"{rep.get('bytes_fetched', 0) / 1e6:.0f} MB in {t_dl:.0f}s{miss})", flush=True)
 
 
 if __name__ == "__main__":
