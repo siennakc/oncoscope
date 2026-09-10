@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -250,6 +251,9 @@ def main() -> None:
     ap.add_argument("--mpp", type=float, default=FM_MPP,
                     help="target um/px (0.5 = FM-native 20x; 0.972 = PCam geometry)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--min-free-gb", type=float, default=8.0,
+                    help="pause prefetching the next slide below this much free "
+                         "disk (two slides are on disk while prefetch is active)")
     ap.add_argument("--workers", type=int, default=8,
                     help="concurrent byte-range connections per slide; S3 throttles "
                          "a single connection well below the link (2 vs 17 MB/s here). "
@@ -312,65 +316,98 @@ def main() -> None:
         """Encoders that still owe a bag for this slide."""
         return [m for m in models if not (embedders[m][2] / f"{nm}.npz").exists()]
 
-    # No background prefetch: fetch() now saturates the link with concurrent
-    # byte ranges, so a second stream would only contend for the same ceiling
-    # (and its partial file would be discarded by the range download anyway).
-    # Peak disk stays exactly one slide.
-    for idx, name in enumerate(names):
-        todo = pending(name)
-        if not todo:
-            print(f"[fm] {name}: cached", flush=True)
-            continue
-        t0 = time.time()
-        slide_path = scratch / f"{name}.tif"
-        fetch(f"images/{name}.tif", slide_path, workers=args.workers)
-        t_dl = time.time() - t0
-        slide = open_slide(slide_path)
-        level, scale = pick_level(slide, target_mpp=args.mpp)
-        coords = tissue_tiles(slide, level, patch=patch)
-        embs = {m: [] for m in todo}
-        batch = []
-        for tile in read_patches(slide, level, coords, scale, patch=patch):
-            batch.append(torch.from_numpy(tile).permute(2, 0, 1))
-            if len(batch) == args.batch:
+    # Download and embed cost roughly the same per slide (~140 s each on a big
+    # one) and use different resources — network vs MPS — so the next slide is
+    # fetched on a worker thread while the current one embeds. That nearly
+    # halves wall clock. It also puts a SECOND slide on disk, so prefetch is
+    # skipped whenever free space is short: a stalled job beats a full disk.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def room_to_prefetch() -> bool:
+        return shutil.disk_usage(scratch).free > args.min_free_gb * (1 << 30)
+
+    def get(nm):
+        return fetch(f"images/{nm}.tif", scratch / f"{nm}.tif", workers=args.workers)
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    inflight = {}
+    try:
+        todo_names = [n for n in names if pending(n)]
+        skipped = len(names) - len(todo_names)
+        if skipped:
+            print(f"[fm] {skipped} slides already cached", flush=True)
+        for idx, name in enumerate(todo_names):
+            todo = pending(name)
+            t0 = time.time()
+            slide_path = scratch / f"{name}.tif"
+            fut = inflight.pop(name, None)
+            if fut is not None:
+                try:
+                    fut.result()      # started while the previous slide embedded
+                except Exception as e:  # noqa: BLE001 - a flaky prefetch must
+                    # not kill a multi-hour job; the range download rewrites
+                    # from scratch, so refetching in the foreground is safe
+                    print(f"[fm] prefetch of {name} failed ({e}); refetching",
+                          flush=True)
+                    get(name)
+            else:
+                get(name)
+            t_dl = time.time() - t0
+            nxt = todo_names[idx + 1] if idx + 1 < len(todo_names) else None
+            if nxt and not inflight:
+                if room_to_prefetch():
+                    inflight[nxt] = pool.submit(get, nxt)
+                else:
+                    print(f"[fm] prefetch paused: free disk under "
+                          f"{args.min_free_gb} GB", flush=True)
+            slide = open_slide(slide_path)
+            level, scale = pick_level(slide, target_mpp=args.mpp)
+            coords = tissue_tiles(slide, level, patch=patch)
+            embs = {m: [] for m in todo}
+            batch = []
+            for tile in read_patches(slide, level, coords, scale, patch=patch):
+                batch.append(torch.from_numpy(tile).permute(2, 0, 1))
+                if len(batch) == args.batch:
+                    x = torch.stack(batch)
+                    for m in todo:
+                        embs[m].append(embedders[m][0](x))
+                    batch = []
+            if batch:
                 x = torch.stack(batch)
                 for m in todo:
                     embs[m].append(embedders[m][0](x))
-                batch = []
-        if batch:
-            x = torch.stack(batch)
+            slide.close()
+            if not args.keep:
+                slide_path.unlink(missing_ok=True)
+            if not any(embs.values()):
+                for m in todo:
+                    failed = record_failure(embedders[m][2], name,
+                                            "0 tissue tiles — inspect the thumbnail; "
+                                            "the tissue mask found nothing")
+                print(f"[fm] {name}: FAILED, 0 tissue tiles — not cached, recorded in "
+                      f"{failed}", flush=True)
+                continue
+            n_tiles, dims = 0, []
             for m in todo:
-                embs[m].append(embedders[m][0](x))
-        slide.close()
-        if not args.keep:
-            slide_path.unlink(missing_ok=True)
-        if not any(embs.values()):
-            for m in todo:
-                failed = record_failure(embedders[m][2], name,
-                                        "0 tissue tiles — inspect the thumbnail; "
-                                        "the tissue mask found nothing")
-            print(f"[fm] {name}: FAILED, 0 tissue tiles — not cached, recorded in "
-                  f"{failed}", flush=True)
-            continue
-        n_tiles, dims = 0, []
-        for m in todo:
-            fn, dim, od = embedders[m]
-            bag = np.concatenate(embs[m])
-            n_tiles, _ = bag.shape[0], dims.append(f"{m}:{dim}d")
-            if bag.shape[0] < 200:
-                print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
-                      "check the thumbnail before trusting this bag", flush=True)
-            save_bag(
-                od / f"{name}.npz", embeddings=bag.astype(np.float16),
-                coords=np.array(coords, np.int32).reshape(-1, 2),
-                level=level, scale=scale, patch=patch, target_mpp=args.mpp,
-                model=m, repo=REGISTRY[m].get("repo", m))
-            (od / f"{name}.json").write_text(json.dumps(
-                {"slide": name, "model": f"{m}_mpp{args.mpp:g}",
-                 "n_tiles": int(bag.shape[0]), "dim": dim, "level": level,
-                 "dl_s": round(t_dl, 1), "total_s": round(time.time() - t0, 1)}))
-        print(f"[fm] {name}: {n_tiles} tiles x [{', '.join(dims)}] "
-              f"({time.time() - t0:.0f}s, dl {t_dl:.0f}s)", flush=True)
+                fn, dim, od = embedders[m]
+                bag = np.concatenate(embs[m])
+                n_tiles, _ = bag.shape[0], dims.append(f"{m}:{dim}d")
+                if bag.shape[0] < 200:
+                    print(f"[fm] WARNING {name}: only {bag.shape[0]} tissue tiles — "
+                          "check the thumbnail before trusting this bag", flush=True)
+                save_bag(
+                    od / f"{name}.npz", embeddings=bag.astype(np.float16),
+                    coords=np.array(coords, np.int32).reshape(-1, 2),
+                    level=level, scale=scale, patch=patch, target_mpp=args.mpp,
+                    model=m, repo=REGISTRY[m].get("repo", m))
+                (od / f"{name}.json").write_text(json.dumps(
+                    {"slide": name, "model": f"{m}_mpp{args.mpp:g}",
+                     "n_tiles": int(bag.shape[0]), "dim": dim, "level": level,
+                     "dl_s": round(t_dl, 1), "total_s": round(time.time() - t0, 1)}))
+            print(f"[fm] {name}: {n_tiles} tiles x [{', '.join(dims)}] "
+                  f"({time.time() - t0:.0f}s, dl {t_dl:.0f}s)", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

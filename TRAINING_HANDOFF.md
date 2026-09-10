@@ -126,18 +126,33 @@ about **0.15 GB** for all of phikon and ~2 GB for pcam_resnet, NOT the 5/13 GB
 an earlier draft of this document claimed. The real disk constraint is the one
 slide held transiently (1-3 GB, occasionally more).
 
-**This job is download-bound, not GPU-bound.** At the measured ~12 MB/s and
-~2.2 GB/slide, the 270 train+val slides are ~594 GB and ~14 h of transfer,
-against only ~1.2 h of MPS embedding. Prefetch overlaps the two, so wall clock
-tracks your bandwidth; on a faster link the whole round is a few hours. Do not
-be alarmed if MPS looks idle — that is the expected shape.
+**This job is download-bound, and the download path matters more than
+anything else here.** S3 throttles a SINGLE connection to ~2.4 MB/s while 8
+concurrent connections sustain ~16.8 MB/s, so `fetch` pulls each slide as
+`--workers 8` byte ranges (measured 15.2 MB/s on a 2.16 GB slide, 6.3x). Do
+not lower `--workers` to 1 unless you are debugging: that alone turns a ~13 h
+run into ~78 h. Integrity is not taken on faith — the parallel download was
+verified byte-for-byte by recomputing S3's multipart ETag locally.
 
-**Disk headroom is the one hard requirement.** The embedder streams one slide
-at a time, but `prefetch` downloads the NEXT slide while the current one
-embeds, so two slides sit on disk at once. Sampled 24 of the 216 train slides:
-median 2.03 GB, max 3.97 GB, mean 2.09 GB (hence the ~565 GB total transfer).
-Worst-case peak is therefore **~7 GB**, and you want **20 GB+ free** so a run
-of large adjacent slides cannot wedge the job. Check `df -h` before starting.
+Embedding is NOT negligible: tile counts vary ~5x across slides (360 to 1755
+seen), so a big slide costs ~140 s of MPS, comparable to its download. The
+next slide is therefore fetched on a worker thread while the current one
+embeds. Measured steady state is ~150-200 s/slide, i.e. **~12-15 h** for 270
+slides with two encoders.
+
+**Embed every encoder you need in ONE pass.** `--model phikon,imagenet_resnet`
+downloads once, tiles once, and writes one bag per encoder from identical
+tiles, so a second encoder costs ~30-100 s/slide instead of a whole second
+pass. Encoders that disagree on tile size are refused (phikon wants 224px,
+pcam_resnet 96px) — run those separately. Decide your encoder list BEFORE
+starting; adding one afterwards means paying the download again.
+
+**Disk headroom is the one hard requirement.** Two slides sit on disk while
+prefetch is active. Sampled 24 of the 216 train slides: median 2.03 GB, max
+3.97 GB, mean 2.09 GB (hence ~565 GB total transfer). Worst-case peak is
+**~7 GB**, and you want **20 GB+ free**. Prefetch pauses itself below
+`--min-free-gb` (default 8) rather than filling the disk, so a tight machine
+degrades to the slower serial path instead of wedging. Check `df -h` first.
 
 Tissue detection was audited on 2026-09-09 and needs no change: the mask is
 computed on the smallest pyramid level, which looked alarmingly coarse (191x424
