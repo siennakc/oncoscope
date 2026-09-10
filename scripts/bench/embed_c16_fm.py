@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -247,7 +248,9 @@ def main() -> None:
                          f"(choices: {', '.join(sorted(REGISTRY))})")
     ap.add_argument("--list", default="")
     ap.add_argument("--list-file", default="")
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=32,
+                    help="tiles per forward pass; activation memory scales with it "
+                         "(32 keeps both encoders comfortable on an 8 GB machine)")
     ap.add_argument("--mpp", type=float, default=FM_MPP,
                     help="target um/px (0.5 = FM-native 20x; 0.972 = PCam geometry)")
     ap.add_argument("--keep", action="store_true")
@@ -352,6 +355,15 @@ def main() -> None:
     if len(names) > len(todo_names):
         print(f"[fm] {len(names) - len(todo_names)} slides already cached", flush=True)
     for name in todo_names:
+        # Release the GPU allocator's cached blocks from the previous slide.
+        # Every slide ends in a differently-sized last batch (n_tiles % batch),
+        # and MPS caches a buffer per shape without handing it back: measured
+        # 4.6 GB of IOAccelerator memory held after ~90 slides on an 8 GB
+        # machine, which drove swap onto a nearly-full disk. `ps` RSS does not
+        # count this memory (it read 28 MB), so check `footprint -p PID`.
+        gc.collect()
+        if dev.type == "mps":
+            torch.mps.empty_cache()
         todo = pending(name)
         t0 = time.time()
         try:
