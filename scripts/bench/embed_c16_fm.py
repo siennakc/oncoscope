@@ -52,7 +52,8 @@ sys.path.insert(0, "scripts/bench")
 import torch  # noqa: E402
 
 from camelyon_lib import (  # noqa: E402
-    BUCKET, fetch, open_slide, pick_level, read_patches, tissue_tiles,
+    BUCKET, fetch, open_slide, pick_level, read_patches, remote_size,
+    tissue_tiles,
 )
 
 FM_PATCH = 224
@@ -251,9 +252,9 @@ def main() -> None:
     ap.add_argument("--mpp", type=float, default=FM_MPP,
                     help="target um/px (0.5 = FM-native 20x; 0.972 = PCam geometry)")
     ap.add_argument("--keep", action="store_true")
-    ap.add_argument("--min-free-gb", type=float, default=8.0,
-                    help="pause prefetching the next slide below this much free "
-                         "disk (two slides are on disk while prefetch is active)")
+    ap.add_argument("--min-free-gb", type=float, default=3.0,
+                    help="headroom to keep FREE after the next slide would land; "
+                         "prefetch pauses below it and the job runs serial")
     ap.add_argument("--workers", type=int, default=8,
                     help="concurrent byte-range connections per slide; S3 throttles "
                          "a single connection well below the link (2 vs 17 MB/s here). "
@@ -323,8 +324,21 @@ def main() -> None:
     # skipped whenever free space is short: a stalled job beats a full disk.
     from concurrent.futures import ThreadPoolExecutor
 
-    def room_to_prefetch() -> bool:
-        return shutil.disk_usage(scratch).free > args.min_free_gb * (1 << 30)
+    def room_to_prefetch(nm: str) -> tuple[bool, str]:
+        """Decide against the NEXT slide's real size, not a flat threshold.
+
+        Slides range ~1.2-4 GB, so one blanket number is wrong in both
+        directions: it blocks a safe 1.2 GB prefetch on a tight disk (costing
+        the download/embed overlap, which is most of the speedup) and would
+        wave through a 4 GB one on the same disk. A HEAD request costs ~0.2 s
+        against a ~150 s download, so just ask.
+        """
+        free = shutil.disk_usage(scratch).free
+        size = remote_size(f"{BUCKET}/images/{nm}.tif") or (4 << 30)
+        margin = args.min_free_gb * (1 << 30)
+        ok = free - size > margin
+        return ok, (f"free {free / (1 << 30):.1f} GB, next slide "
+                    f"{size / (1 << 30):.1f} GB, margin {args.min_free_gb} GB")
 
     def get(nm):
         return fetch(f"images/{nm}.tif", scratch / f"{nm}.tif", workers=args.workers)
@@ -355,11 +369,12 @@ def main() -> None:
             t_dl = time.time() - t0
             nxt = todo_names[idx + 1] if idx + 1 < len(todo_names) else None
             if nxt and not inflight:
-                if room_to_prefetch():
+                ok, why = room_to_prefetch(nxt)
+                if ok:
                     inflight[nxt] = pool.submit(get, nxt)
                 else:
-                    print(f"[fm] prefetch paused: free disk under "
-                          f"{args.min_free_gb} GB", flush=True)
+                    print(f"[fm] prefetch paused ({why}) — running serial, "
+                          "free disk to restore the overlap", flush=True)
             slide = open_slide(slide_path)
             level, scale = pick_level(slide, target_mpp=args.mpp)
             coords = tissue_tiles(slide, level, patch=patch)
