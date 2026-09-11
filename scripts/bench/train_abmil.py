@@ -92,20 +92,35 @@ def require_bags(embed_dir: Path, names: list[str], what: str, hint: str) -> Non
                          f"{embed_dir} (first: {missing[:3]}) — {hint}")
 
 
-def load_bags(embed_dir: Path, names: list[str]):
-    """Bags stay float16, exactly as stored.
+class LazyBags:
+    """Bags read from their .npz on each access, never all held in RAM.
 
-    Every consumer (train step, predict, attention) converts a bag to float32
-    at the moment it is used, so up-casting here only doubled the footprint:
-    all 270 imagenet_resnet bags are 783,635 x 2048 = 6.4 GB as float32 but
-    3.2 GB as float16, on an 8 GB machine. fp16 -> fp32 is exact, so results
-    are bit-identical either way.
+    Training touches every bag every epoch, so holding them resident keeps the
+    whole set in memory at once: 3.2 GB of imagenet_resnet float16 on an 8 GB
+    machine, which macOS compressed and then thrashed decompressing each epoch
+    (trainer at 0% CPU, swap grown onto a 99%-full disk). Reading on demand
+    keeps one bag resident and uses the .npz files already on disk, so it costs
+    no disk space; decompressing is ~10 ms against ~57 ms of compute per bag.
+    Bags stay float16 as stored — every consumer converts to float32 at use,
+    and fp16 -> fp32 is exact — so results are bit-identical to holding them.
     """
-    bags = []
-    for n in names:
-        with np.load(embed_dir / f"{n}.npz") as z:
-            bags.append(np.asarray(z["embeddings"]))
-    return bags
+
+    def __init__(self, embed_dir: Path, names: list[str]):
+        self._paths = [embed_dir / f"{n}.npz" for n in names]
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __getitem__(self, i) -> np.ndarray:
+        with np.load(self._paths[i]) as z:
+            return np.asarray(z["embeddings"])
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
+
+
+def load_bags(embed_dir: Path, names: list[str]) -> LazyBags:
+    return LazyBags(embed_dir, names)
 
 
 def queries_spent(mdir: Path) -> int:
