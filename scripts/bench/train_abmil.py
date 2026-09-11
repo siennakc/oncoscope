@@ -93,10 +93,18 @@ def require_bags(embed_dir: Path, names: list[str], what: str, hint: str) -> Non
 
 
 def load_bags(embed_dir: Path, names: list[str]):
+    """Bags stay float16, exactly as stored.
+
+    Every consumer (train step, predict, attention) converts a bag to float32
+    at the moment it is used, so up-casting here only doubled the footprint:
+    all 270 imagenet_resnet bags are 783,635 x 2048 = 6.4 GB as float32 but
+    3.2 GB as float16, on an 8 GB machine. fp16 -> fp32 is exact, so results
+    are bit-identical either way.
+    """
     bags = []
     for n in names:
         with np.load(embed_dir / f"{n}.npz") as z:
-            bags.append(z["embeddings"].astype(np.float32))
+            bags.append(np.asarray(z["embeddings"]))
     return bags
 
 
